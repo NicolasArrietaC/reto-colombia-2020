@@ -1,0 +1,1426 @@
+---
+title: "Brand Expansion Bavaria"
+subtitle: "Un problema de predicción de ventas"
+author: "Nicolas Arrieta y Heriberto Felizzola (Backfitting)"
+date: "11/27/2020"
+output:
+  html_document: 
+    code_folding: hide
+    theme: flatly
+    toc: yes
+    toc_depth: 2
+editor_options: 
+  chunk_output_type: console
+---
+
+# Librerias
+
+```{r librerias, message = F, warning = F}
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(lubridate)
+library(ranger)
+library(vip)
+
+knitr::opts_chunk$set(message = F, 
+                      warning = F, 
+                      fig.align = "center")
+```
+
+# Conjunto de datos
+
+```{r lectura de datos}
+# Conjunto de datos de clientes
+clientes <- read_delim(file = "Datasets/Input1_clientes_estructura.csv",
+                     locale = locale(encoding = 'UTF-8'), delim = ";")
+
+# Conjunto de datos de ventas
+ventas <- read_delim(file = "Datasets/Input2_clientes_venta.csv",
+                   locale = locale(encoding = 'UTF-8'), delim = ";")
+
+# Conjunto de datos salida
+output <- read_delim(file = "Datasets/Input3_clientes_test.csv",
+                   locale = locale(encoding = 'UTF-8'), delim = ";")
+```
+
+# Limpieza
+
+## Renombres
+
+Creación de variable categorica con los productos de interés en el caso
+
+```{r}
+ventas <- ventas %>% 
+ mutate(Marca_ints = case_when(
+  Marca2 == "Marca_20" & Cupo2 == "Cupo_3" & 
+   CapacidadEnvase2 == "CapacidadEnvase_9" ~ "Marca1",
+  Marca2 == "Marca_16" & Cupo2 == "Cupo_2" & 
+   CapacidadEnvase2 == "CapacidadEnvase_10" ~ "Marca2",
+  Marca2 == "Marca_9" & Cupo2 == "Cupo_3" & 
+   CapacidadEnvase2 == "CapacidadEnvase_12" ~ "Marca3",
+  Marca2 == "Marca_38" & Cupo2 == "Cupo_2" & 
+   CapacidadEnvase2 == "CapacidadEnvase_10" ~ "Marca_Inno1",
+  Marca2 == "Marca_39" & Cupo2 == "Cupo_2" & 
+   CapacidadEnvase2 == "CapacidadEnvase_10" ~ "Marca_Inno2",
+  TRUE ~ "Otro"))
+```
+
+transformación de tipo de dato a la variable de cliente
+
+```{r}
+ventas$Cliente <- as.character(ventas$Cliente)
+```
+
+transformar la variable descuento en positiva
+
+```{r}
+ventas$disc <- abs(ventas$disc)
+```
+
+Priorizar categorias de las varaibles categoricas de los clientes
+
+Variable categoria
+
+```{r}
+clientes <- clientes %>% 
+  mutate(categoria2 = case_when(
+    Categoria %in% c("Categoria_1", "Categoria_2", "Categoria_3") ~
+      Categoria, TRUE ~ "Otro"))
+```
+
+Reagrupar la clase de gerencia
+
+```{r}
+clientes <- clientes %>% 
+  mutate(cat_gerencia = case_when(
+    Gerencia2 %in% c("Gerencia_5", "Gerencia_7", "Gerencia_11") ~
+      "Otro", TRUE ~ Gerencia2))
+```
+
+Reagrupar la clase de SubCanal2
+
+```{r}
+clientes <- clientes %>% 
+  mutate(cat_subcanal = case_when(
+    SubCanal2 %in% c("Subcanal_1", "Subcanal_2", "Subcanal_3",
+                     "Subcanal_4", "Subcanal_5", "Subcanal_7",
+                     "Subcanal_8", "Subcanal_10", "Subcanal_11",
+                     "Subcanal_13") ~ SubCanal2, TRUE ~ "Otro"))
+```
+
+Remover regional
+
+```{r}
+clientes$Regional2 <- NULL
+```
+
+
+## Filtro de registros
+
+Descuentos y precio
+
+```{r}
+ventas <- ventas %>% filter(nr > 0) %>% 
+ mutate(por_des = abs(disc)/(nr + abs(disc)),
+        por_des = round(por_des * 100, 2))
+
+ventas %>% ggplot(aes(x = por_des)) + geom_histogram()
+```
+
+Ventas con descuentos mayores al 60%
+
+```{r}
+ventas %>% filter(por_des > 60) %>% count()
+```
+
+```{r}
+head(ventas %>% filter(por_des > 60) %>% 
+      select(disc, nr, por_des) %>% arrange(desc(por_des, F)), 15)
+```
+
+```{r}
+ventas %>% filter(por_des >= 60) %>% 
+ ggplot(aes(x = por_des)) + geom_histogram() + 
+ scale_x_continuous(breaks = seq(60, 100, 10))
+```
+
+Ventas con descuentos menores al 1%
+
+Se presenta un problema evidente
+
+```{r}
+head(ventas %>% filter(por_des > 0) %>% 
+      select(disc, nr, por_des) %>% arrange(por_des), 15)
+```
+
+Hay una frecuencia muy alta, corresponde al 2%
+
+```{r}
+ventas %>% filter(por_des > 0, por_des <= 10) %>% 
+ ggplot(aes(x = por_des)) + geom_histogram() + 
+ scale_x_continuous(breaks = seq(0, 10, 1))
+```
+
+# Análsis exploratorio de datos
+
+## Clientes
+
+Correlaciones entre las variables categoricas 
+
+```{r}
+dist_categ <- merge(clientes, ventas, by = "Cliente", all.y = T) %>% 
+  group_by(Cliente, cat_gerencia, cat_subcanal, categoria2) %>% 
+  summarise(frecuencia = n(),
+         volumen_tot = sum(Volumen),
+         volumen_med = mean(Volumen),
+         volumen_sd = sd(Volumen),
+         valor_tot = sum(nr),
+         valor_med = mean(nr),
+         valor_sd = sd(nr),
+         desc_tot = sum(disc),
+         desc_med = mean(disc),
+         desc_sd = sd(disc),
+         desc_med = mean(por_des),
+         desc_sd = sd(por_des),
+         n_marcas = n_distinct(Marca2))
+```
+
+Grafica donde se dimensionan las tres variables
+
+```{r}
+dist_categ %>% ungroup() %>% 
+  mutate(Gerencia2 = as.factor(cat_gerencia)) %>% 
+  ggplot(aes(x = n_marcas, y = fct_reorder(Gerencia2, frecuencia), 
+             fill = cat_subcanal)) +
+  facet_wrap(vars(categoria2)) + geom_col() +
+  theme(legend.position = "none") + theme_light() +
+  scale_color_brewer(palette = "Set1") + 
+  labs(title = "Ventas", x = "Cantidad", y = "Gerencia")
+```
+
+Hallazgos
+
+* En la frecuencia, la gerencia 5, 7, 11 es muy poca frecuente, igual en volumen,
+* Las gerencias 8, 6 y 10 son las más frecuentes, igual en volumen.
+* las gerencias 1, 2, 3, 4 y 9 son las medio frecuentes, igual en volumen.
+
+
+* Las categorias 1, 2, 3 son las mas frecuentes, igual con volumen.
+* Las categorias 4, y, 6 son la menos frecuente, igual con volumen
+
+* En volumen medio cambia un poco la relación de las 7, 5, 11
+
+Detalle del subcanal
+
+```{r}
+dist_categ %>% group_by(SubCanal2) %>% 
+  summarise(val = sum(desc_tot)) %>% 
+  ggplot(aes(x = val, y = fct_reorder(SubCanal2, val))) + 
+  geom_col()
+```
+
+Hallazgos
+
+*  Los subcanales 3, 1, 5, 4, 8, 2 son los mas frecuentes
+* Atras estan el 6, 11, 10, 7, 13 y 9
+
+* En valor y volumen estan el 3, 13, 1, 5, 4, 2, 7
+* Dpues le sigue el 8, 16, 11, 10 y 9
+
+
+## Ventas
+
+Serie de tiempo por segmento
+
+```{r}
+st_ventas <- ventas %>% mutate(fecha_men = make_date(Año, Mes, "01")) %>%
+             group_by(fecha_men, SegmentoPrecio2) %>% 
+ summarise(n_ventas = n(), ingreso_neto = sum(nr)/1e6)
+
+st_ventas %>% 
+ ggplot(aes(x = fecha_men, y = n_ventas, color = SegmentoPrecio2)) + 
+ geom_line() + geom_point()
+```
+
+```{r}
+st_ventas %>% 
+  rename(`Seg. Precio` = SegmentoPrecio2) %>% 
+  mutate(`Seg. Precio` = case_when(
+    `Seg. Precio` == "SegmentoPrecio_1" ~ "SP_1",
+    `Seg. Precio` == "SegmentoPrecio_2" ~ "SP_2",
+    `Seg. Precio` == "SegmentoPrecio_3" ~ "SP_3")) %>% 
+ ggplot(aes(x = fecha_men, y = ingreso_neto, color = `Seg. Precio`)) + geom_line() + geom_point() +
+  labs(x = "Mes", y = "Ingreso Mill.",
+       title = "Ingresos Mesuales") + theme_light() +
+  scale_color_brewer(palette="Set1")
+```
+
+Ventas por las marcas de interes
+
+```{r}
+ventas %>% mutate(fecha_men = make_date(Año, Mes, "01")) %>%
+  filter(Marca_ints != "Otro") %>% 
+  rename(Referencias = Marca_ints) %>% 
+  group_by(Referencias, fecha_men) %>% 
+  summarise(ingresos_m = sum(nr)/1e6) %>% 
+  ggplot(aes(x = fecha_men, y = ingresos_m, color = Referencias)) +
+  geom_line() + geom_point() +
+  labs(x = "Mes", y = "Ingreso Mill.",
+       title = "Ingresos Mesuales",
+       subtitle = "Ingreso por referencia de interés") + theme_light() +
+  scale_color_brewer(palette = "Set1")
+```
+
+serie de tiempo por segmento y marca
+
+```{r}
+st_ventas1 <- ventas %>% mutate(fecha_men = make_date(Año, Mes, "01")) %>%
+              group_by(fecha_men, SegmentoPrecio2, Marca2) %>% 
+ summarise(n_ventas = n(), ingreso_neto = sum(nr))
+
+st_ventas1 %>% 
+ ggplot(aes(x = fecha_men, y = n_ventas, color = Marca2)) + 
+ facet_wrap(vars(SegmentoPrecio2), scales = "free_y") + geom_line() + geom_point() +
+ theme(legend.position = "none")
+```
+
+```{r}
+st_ventas1 %>% 
+ ggplot(aes(x = fecha_men, y = ingreso_neto, color = Marca2)) + 
+ facet_wrap(vars(SegmentoPrecio2)) + geom_line() + geom_point() +
+ theme(legend.position = "none")
+```
+
+
+# Ingeniería de variables
+
+## Creación de la base del dataset
+
+```{r}
+lis_clientes <- ventas %>%
+  select(Cliente) %>% unique()
+
+# Creación del conjunto de test
+prob_compra <- expand_grid(Cliente = lis_clientes[][[1]], 
+ Marca_ints = c("Marca1", "Marca2", "Marca3", 
+                "Marca_Inno1", "Marca_Inno2"))
+
+prob_compra <- prob_compra %>% 
+ mutate(Marca2 = case_when(Marca_ints == "Marca1" ~ "Marca_20",
+                           Marca_ints == "Marca2" ~ "Marca_16",
+                           Marca_ints == "Marca3" ~ "Marca_9",
+                           Marca_ints == "Marca_Inno1" ~ "Marca_38",
+                           Marca_ints == "Marca_Inno2" ~ "Marca_39"))
+```
+
+Agregación de la variable a predecir al dataset
+
+Creación de la variable a predecir (Compra del producto i en el mes de sep del 2020)
+
+```{r}
+compra_sep <- ventas %>% filter(Año == 2020 & Mes == 9,
+      Marca_ints %in% c("Marca1", "Marca2", "Marca3", 
+                        "Marca_Inno1", "Marca_Inno2")) %>% 
+ select(Cliente, Marca_ints) %>% unique()
+
+# Agregar la activación de la variable
+compra_sep$compra <- 1
+```
+
+Agregación  al datasets completo
+
+```{r}
+prob_compra <- merge(prob_compra, compra_sep, 
+                     by = c("Cliente", "Marca_ints"),
+                     all.x = T)
+
+# Agregación de los valores negativos
+prob_compra$compra <- if_else(is.na(prob_compra$compra), 0 , 1)
+```
+
+### Agregación de variables predictorias
+
+> Historico de compra mensual
+
+Calculo de probabilidad mensual para cada marca
+
+```{r}
+meses <- dmy(c("01-09-2019", "01-10-2019", "01-11-2019",
+           "01-06-2020", "01-07-2020", "01-08-2020"))
+
+prob_emp_mes <- ventas %>%
+  mutate(fecha = make_date(Año, Mes, "01")) %>% 
+ filter(fecha %in% meses) %>% 
+ group_by(Cliente, Marca_ints, Mes) %>% 
+ summarise(volumen_total = sum(Volumen, na.rm = T)) %>% 
+ group_by(Cliente, Mes) %>% 
+ mutate(volumen_total_cliente = sum(volumen_total),
+        prob = volumen_total/volumen_total_cliente) %>% 
+ filter(Marca_ints != "Otro")
+```
+
+transformación del mes a columna
+
+```{r}
+prob_emp_mes <- prob_emp_mes %>%
+ select(-c(volumen_total, volumen_total_cliente)) %>% 
+ mutate(Mes = paste0("Pb_Ref_", Mes)) %>%
+ pivot_wider(names_from = Mes, values_from = prob)
+```
+
+Agregación al conjunto de datos completo
+
+```{r}
+prob_compra <- merge(prob_compra, prob_emp_mes, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+prob_compra <- prob_compra %>% mutate_all(~replace(., is.na(.), 0))
+```
+
+> Probabilidad de comprar un producto de la misma marca
+
+Generar una variable de prob
+
+```{r}
+prob_emp <- ventas %>% 
+  mutate(fecha = make_date(Año, Mes, "01")) %>% 
+  filter(fecha %in% meses) %>% 
+  group_by(Cliente, Marca2, Mes) %>%
+  summarise(volumen_total = sum(Volumen, na.rm = T)) %>% 
+  group_by(Cliente, Mes) %>% 
+  mutate(volumen_total_cliente = sum(volumen_total),
+          prob = volumen_total/volumen_total_cliente) %>% 
+  mutate(Mes = paste0("Compro_Marca_", Mes))
+
+prob_emp <- prob_emp %>%
+  select(-c(volumen_total, volumen_total_cliente)) %>% 
+  pivot_wider(names_from = Mes, values_from = prob)
+```
+
+Agregación al dataset
+
+```{r}
+prob_compra <- merge(prob_compra, prob_emp, 
+                     by = c("Cliente", "Marca2"), all.x = T)
+
+prob_compra <- prob_compra %>% mutate_all(~replace(., is.na(.), 0))
+```
+
+> Cantidad de referencias que ha manejado de la misma marca
+
+Calculo de diversidad de marca por cliente
+
+```{r}
+diversidad_marca <- ventas %>%
+ filter(!(Año == 2020 & Mes == 9)) %>% 
+ group_by(Cliente, Marca2) %>% 
+ summarise(diversidad = n_distinct(Cupo2, CapacidadEnvase2))
+```
+
+Asignación al conjunto total
+
+```{r}
+prob_compra <- merge(prob_compra, diversidad_marca, 
+                     by = c("Cliente", "Marca2"), all.x = T)
+
+prob_compra[is.na(prob_compra$diversidad), "diversidad"] <- 0
+```
+
+> Tiene nevera de la empresa
+
+```{r}
+prob_compra <- merge(prob_compra, clientes %>% select(Cliente, Nevera), 
+                     by = "Cliente", all.x = T)
+
+prob_compra$Nevera <- as.factor(prob_compra$Nevera)
+```
+
+> Historico de ventas de la referencia de la marca
+
+Calculo
+
+```{r}
+hist_com_gen <- ventas %>%
+  filter(!(Año == 2020 & Mes == 9)) %>% 
+  group_by(Cliente, Marca_ints) %>% 
+  summarise(volumen_acum_ref = sum(Volumen),
+            valor_acum_ref = sum(nr),
+            desc_acum_ref = sum(disc)) %>% 
+  filter(Marca_ints != "Otro")
+```
+
+Asignación
+
+```{r}
+prob_compra <- merge(prob_compra, hist_com_gen, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+prob_compra <- prob_compra %>% mutate_all(~replace(., is.na(.), 0))
+```
+
+> Historico de ventas de la marca
+
+Calculo
+
+```{r}
+hist_com_gen <- ventas %>%
+  filter(!(Año == 2020 & Mes == 9)) %>% 
+  group_by(Cliente, Marca2) %>% 
+  summarise(volumen_acum_mar = sum(Volumen),
+            valor_acum_mar = sum(nr),
+            desc_acum_mar = sum(disc))
+```
+
+Asignación
+
+```{r}
+prob_compra <- merge(prob_compra, hist_com_gen, 
+                     by = c("Cliente", "Marca2"), all.x = T)
+
+prob_compra <- prob_compra %>% mutate_all(~replace(., is.na(.), 0))
+``` 
+
+> Historico de ventas total
+
+Calculo
+
+```{r}
+hist_com_gen <- ventas %>%
+  filter(!(Año == 2020 & Mes == 9)) %>% 
+  group_by(Cliente) %>% 
+  summarise(volumen_acum_tot = sum(Volumen),
+            valor_acum_tot = sum(nr),
+            desc_acum_tot = sum(disc))
+```
+
+Asignación
+
+```{r}
+prob_compra <- merge(prob_compra, hist_com_gen, 
+                     by = "Cliente", all.x = T)
+
+prob_compra <- prob_compra %>% mutate_all(~replace(., is.na(.), 0))
+``` 
+
+> Variables categoricas del cliente
+
+```{r}
+caract_cliente <- clientes %>% 
+  select(Cliente, categoria2, cat_gerencia, cat_subcanal) %>% 
+  unique()
+```
+
+Agregar
+
+```{r}
+prob_compra <- merge(prob_compra, caract_cliente, 
+                     by = "Cliente", all.x = T)
+
+prob_compra <- prob_compra %>% 
+  mutate(
+    categoria2 = if_else(is.na(categoria2), "Otro", categoria2),
+    cat_gerencia = if_else(is.na(cat_gerencia), "Otro", cat_gerencia),
+    cat_subcanal = if_else(is.na(cat_subcanal), "Otro", cat_subcanal))
+
+```
+
+> Patrones en el comportamiento de cumsum (cusum)
+
+```{r}
+comp_cons <- ventas %>%
+  mutate(fecha = make_date(Año, Mes, "01")) %>%
+  filter(fecha >= dmy("01-04-2020"), fecha <= dmy("01-08-2020")) %>% 
+  arrange(fecha) %>% 
+  group_by(Cliente, Marca_ints, fecha) %>%
+  mutate(valor = sum(nr),
+         descuento = sum(disc)) %>% 
+  group_by(Cliente, Marca_ints) %>% 
+  mutate(valor_acum = cumsum(valor),
+         descuento_acum = cumsum(descuento)) %>% 
+  ungroup()
+```
+
+```{r}
+comp_cons$periodo <- 1
+
+comp_cons <- comp_cons %>%
+  select(Cliente, Marca_ints, fecha, valor, descuento,
+         valor_acum, descuento_acum, periodo, fecha) %>% unique() %>% 
+  group_by(Cliente, Marca_ints) %>% 
+  mutate(orden_periodo = cumsum(periodo))
+```
+
+
+```{r}
+comp_cons <- comp_cons %>% 
+  mutate(valor_promedio_llevado = valor_acum/orden_periodo,
+      descuento_promedio_llevado = descuento_acum/orden_periodo,
+      variacion_valor = valor - valor_promedio_llevado,
+      variacion_desto = descuento - descuento_promedio_llevado) %>% 
+  group_by(Cliente, Marca_ints) %>% 
+  mutate(variacion_valor_acum = cumsum(variacion_valor),
+            variacion_desto_acum = cumsum(variacion_desto)) %>% 
+  filter(Marca_ints != "Otro")
+```
+
+```{r}
+comp_cons <- comp_cons %>%
+  mutate(orden_periodo = orden_periodo,
+         fecha = paste0(month(fecha), "_", year(fecha))) %>% 
+  select(Cliente, Marca_ints, fecha, orden_periodo,
+         valor_promedio_llevado, descuento_promedio_llevado,
+         variacion_valor_acum, variacion_desto_acum) %>% unique() %>% 
+  filter(orden_periodo > 1) %>%
+  select(-orden_periodo) %>% 
+  mutate(fecha = paste0("periodo_", fecha))
+```
+
+```{r}
+comp_cons_valor <- comp_cons %>%
+  mutate(fecha = paste0(fecha, "_val")) %>% 
+  select(Cliente, Marca_ints, fecha, 
+         variacion_valor_acum) %>%
+  pivot_wider(names_from = fecha, 
+              values_from = variacion_valor_acum)
+```
+
+```{r}
+comp_cons_dcto <- comp_cons %>%
+  mutate(fecha = paste0(fecha, "_dcto")) %>%  
+  select(Cliente, Marca_ints, fecha, 
+         variacion_desto_acum) %>%
+  pivot_wider(names_from = fecha, 
+              values_from = variacion_desto_acum)
+```
+
+```{r}
+comp_cons_promv <- comp_cons %>%
+  mutate(fecha = paste0(fecha, "_val_md")) %>%  
+  select(Cliente, Marca_ints, fecha, 
+         valor_promedio_llevado) %>%
+  pivot_wider(names_from = fecha, 
+              values_from = valor_promedio_llevado)
+```
+
+```{r}
+comp_cons_promd <- comp_cons %>%
+  mutate(fecha = paste0(fecha, "_dcto_md")) %>%  
+  select(Cliente, Marca_ints, fecha, 
+         descuento_promedio_llevado) %>%
+  pivot_wider(names_from = fecha, 
+              values_from = descuento_promedio_llevado)
+```
+
+```{r}
+prob_compra <- merge(prob_compra, comp_cons_valor, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+prob_compra <- merge(prob_compra, comp_cons_dcto, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+prob_compra <- merge(prob_compra, comp_cons_promv, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+prob_compra <- merge(prob_compra, comp_cons_promd, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+prob_compra <- prob_compra %>% mutate_all(~replace(., is.na(.), 0))
+```
+
+> Definir los registros de training y testing
+
+```{r}
+prob_compra <- prob_compra %>% 
+  mutate(split = if_else(Cliente %in% output$Cliente, "Test", "Train"))
+```
+
+> Otros ajustes
+
+```{r}
+prob_compra <- prob_compra %>% mutate(compra = if_else(compra == 1, "Si", "No"))
+```
+
+## Conjunto de datos a predecir
+
+```{r}
+output_tem <- output %>% 
+ pivot_longer(cols = c("Marca1", "Marca2", "Marca3",
+                       "Marca_Inno1","Marca_Inno2"), 
+              names_to = "Marca_ints", values_to = "prob")
+
+output_tem$Cliente <- as.character(output_tem$Cliente) 
+```
+
+```{r}
+output_tem <- output_tem %>% 
+ mutate(Marca2 = case_when(Marca_ints == "Marca1" ~ "Marca_20",
+                           Marca_ints == "Marca2" ~ "Marca_16",
+                           Marca_ints == "Marca3" ~ "Marca_9",
+                           Marca_ints == "Marca_Inno1" ~ "Marca_38",
+                           Marca_ints == "Marca_Inno2" ~ "Marca_39"))
+```
+
+> Historico de compra mensual
+
+Calculo de probabilidad mensual para cada marca
+
+```{r}
+meses <- dmy(c("01-09-2019", "01-10-2019", "01-11-2019",
+           "01-07-2020", "01-08-2020", "01-09-2020"))
+
+prob_emp_mes <- ventas %>%
+  mutate(fecha = make_date(Año, Mes, "01")) %>% 
+ filter(fecha %in% meses) %>% 
+ mutate(fecha = case_when(fecha == dmy("01-07-2020") ~ dmy("01-06-2020"),
+                          fecha == dmy("01-08-2020") ~ dmy("01-07-2020"),
+                          fecha == dmy("01-09-2020") ~ dmy("01-08-2020"),
+                          TRUE ~ fecha),
+        Mes = month(fecha)) %>% 
+  group_by(Cliente, Marca_ints, Mes) %>% 
+ summarise(volumen_total = sum(Volumen, na.rm = T)) %>% 
+ group_by(Cliente, Mes) %>% 
+ mutate(volumen_total_cliente = sum(volumen_total),
+        prob = volumen_total/volumen_total_cliente) %>% 
+ filter(Marca_ints != "Otro")
+```
+
+transformación del mes a columna
+
+```{r}
+prob_emp_mes <- prob_emp_mes %>%
+ select(-c(volumen_total, volumen_total_cliente)) %>% 
+ mutate(Mes = paste0("Pb_Ref_", Mes)) %>%
+ pivot_wider(names_from = Mes, values_from = prob)
+```
+
+Agregación al conjunto de datos completo
+
+```{r}
+output_tem <- merge(output_tem, prob_emp_mes, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+output_tem <- output_tem %>% mutate_all(~replace(., is.na(.), 0))
+```
+
+> Probabilidad de comprar un producto de la misma marca
+
+Generar una variable de prob
+
+```{r}
+prob_emp <- ventas %>% 
+  mutate(fecha = make_date(Año, Mes, "01")) %>% 
+  filter(fecha %in% meses) %>%
+  mutate(fecha = case_when(fecha == dmy("01-07-2020") ~ dmy("01-06-2020"),
+                          fecha == dmy("01-08-2020") ~ dmy("01-07-2020"),
+                          fecha == dmy("01-09-2020") ~ dmy("01-08-2020"),
+                          TRUE ~ fecha),
+        Mes = month(fecha)) %>% 
+  group_by(Cliente, Marca2, Mes) %>%
+  summarise(volumen_total = sum(Volumen, na.rm = T)) %>% 
+  group_by(Cliente, Mes) %>% 
+  mutate(volumen_total_cliente = sum(volumen_total),
+          prob = volumen_total/volumen_total_cliente) %>% 
+  mutate(Mes = paste0("Compro_Marca_", Mes))
+
+prob_emp <- prob_emp %>%
+  select(-c(volumen_total, volumen_total_cliente)) %>% 
+  pivot_wider(names_from = Mes, values_from = prob)
+```
+
+Agregación al dataset
+
+```{r}
+output_tem <- merge(output_tem, prob_emp, 
+                     by = c("Cliente", "Marca2"), all.x = T)
+
+output_tem <- output_tem %>% mutate_all(~replace(., is.na(.), 0))
+```
+
+> Cantidad de referencias que ha manejado de la misma marca
+
+Calculo de diversidad de marca por cliente
+
+```{r}
+diversidad_marca <- ventas %>%
+ group_by(Cliente, Marca2) %>% 
+ summarise(diversidad = n_distinct(Cupo2, CapacidadEnvase2))
+```
+
+Asignación al conjunto total
+
+```{r}
+output_tem <- merge(output_tem, diversidad_marca, 
+                     by = c("Cliente", "Marca2"), all.x = T)
+
+output_tem[is.na(output_tem$diversidad), "diversidad"] <- 0
+```
+
+> Tiene nevera de la empresa
+
+```{r}
+output_tem <- merge(output_tem, clientes %>% select(Cliente, Nevera), 
+                     by = "Cliente", all.x = T)
+
+output_tem$Nevera <- as.factor(output_tem$Nevera)
+```
+
+> Historico de ventas de la referencia de la marca
+
+Calculo
+
+```{r}
+hist_com_gen <- ventas %>% 
+  group_by(Cliente, Marca_ints) %>% 
+  summarise(volumen_acum_ref = sum(Volumen),
+            valor_acum_ref = sum(nr),
+            desc_acum_ref = sum(disc)) %>% 
+  filter(Marca_ints != "Otro")
+```
+
+Asignación
+
+```{r}
+output_tem <- merge(output_tem, hist_com_gen, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+output_tem <- output_tem %>% mutate_all(~replace(., is.na(.), 0))
+```
+
+> Historico de ventas de la marca
+
+Calculo
+
+```{r}
+hist_com_gen <- ventas %>% 
+  group_by(Cliente, Marca2) %>% 
+  summarise(volumen_acum_mar = sum(Volumen),
+            valor_acum_mar = sum(nr),
+            desc_acum_mar = sum(disc))
+```
+
+Asignación
+
+```{r}
+output_tem <- merge(output_tem, hist_com_gen, 
+                     by = c("Cliente", "Marca2"), all.x = T)
+
+output_tem <- output_tem %>% mutate_all(~replace(., is.na(.), 0))
+``` 
+
+> Historico de ventas total
+
+Calculo
+
+```{r}
+hist_com_gen <- ventas %>% 
+  group_by(Cliente) %>% 
+  summarise(volumen_acum_tot = sum(Volumen),
+            valor_acum_tot = sum(nr),
+            desc_acum_tot = sum(disc))
+```
+
+Asignación
+
+```{r}
+output_tem <- merge(output_tem, hist_com_gen, 
+                     by = "Cliente", all.x = T)
+
+output_tem <- output_tem %>% mutate_all(~replace(., is.na(.), 0))
+``` 
+
+> Variables categoricas del cliente
+
+```{r}
+caract_cliente <- clientes %>% 
+  select(Cliente, categoria2, cat_gerencia, cat_subcanal) %>% 
+  unique()
+```
+
+Agregar
+
+```{r}
+output_tem <- merge(output_tem, caract_cliente, 
+                     by = "Cliente", all.x = T)
+
+output_tem <- output_tem %>% 
+  mutate(
+    categoria2 = if_else(is.na(categoria2), "Ninguno", categoria2),
+    cat_gerencia = if_else(is.na(cat_gerencia), "Ninguno", cat_gerencia),
+    cat_subcanal = if_else(is.na(cat_subcanal), "Ninguno", cat_subcanal))
+
+```
+
+> Patrones en el comportamiento de cumsum (cusum)
+
+```{r}
+comp_cons <- ventas %>%
+  mutate(fecha = make_date(Año, Mes, "01")) %>%
+  filter(fecha >= dmy("01-05-2020"), fecha <= dmy("01-09-2020")) %>%
+  mutate(fecha = case_when(fecha == dmy("01-05-2020") ~ dmy("01-04-2020"),
+                          fecha == dmy("01-06-2020") ~ dmy("01-05-2020"),
+                          fecha == dmy("01-07-2020") ~ dmy("01-06-2020"),
+                          fecha == dmy("01-08-2020") ~ dmy("01-07-2020"),
+                          fecha == dmy("01-09-2020") ~ dmy("01-08-2020"),
+                          TRUE ~ fecha)) %>% 
+  arrange(fecha) %>% 
+  group_by(Cliente, Marca_ints, fecha) %>%
+  mutate(valor = sum(nr),
+         descuento = sum(disc)) %>% 
+  group_by(Cliente, Marca_ints) %>% 
+  mutate(valor_acum = cumsum(valor),
+         descuento_acum = cumsum(descuento)) %>% 
+  ungroup()
+```
+
+```{r}
+comp_cons$periodo <- 1
+
+comp_cons <- comp_cons %>%
+  select(Cliente, Marca_ints, fecha, valor, descuento,
+         valor_acum, descuento_acum, periodo, fecha) %>% unique() %>% 
+  group_by(Cliente, Marca_ints) %>% 
+  mutate(orden_periodo = cumsum(periodo))
+```
+
+
+```{r}
+comp_cons <- comp_cons %>% 
+  mutate(valor_promedio_llevado = valor_acum/orden_periodo,
+      descuento_promedio_llevado = descuento_acum/orden_periodo,
+      variacion_valor = valor - valor_promedio_llevado,
+      variacion_desto = descuento - descuento_promedio_llevado) %>% 
+  group_by(Cliente, Marca_ints) %>% 
+  mutate(variacion_valor_acum = cumsum(variacion_valor),
+            variacion_desto_acum = cumsum(variacion_desto)) %>% 
+  filter(Marca_ints != "Otro")
+```
+
+```{r}
+comp_cons <- comp_cons %>%
+  mutate(orden_periodo = orden_periodo,
+         fecha = paste0(month(fecha), "_", year(fecha))) %>% 
+  select(Cliente, Marca_ints, fecha, orden_periodo,
+         valor_promedio_llevado, descuento_promedio_llevado,
+         variacion_valor_acum, variacion_desto_acum) %>% unique() %>% 
+  filter(orden_periodo > 1) %>%
+  select(-orden_periodo) %>% 
+  mutate(fecha = paste0("periodo_", fecha))
+```
+
+```{r}
+comp_cons_valor <- comp_cons %>%
+  mutate(fecha = paste0(fecha, "_val")) %>% 
+  select(Cliente, Marca_ints, fecha, 
+         variacion_valor_acum) %>%
+  pivot_wider(names_from = fecha, 
+              values_from = variacion_valor_acum)
+```
+
+```{r}
+comp_cons_dcto <- comp_cons %>%
+  mutate(fecha = paste0(fecha, "_dcto")) %>%  
+  select(Cliente, Marca_ints, fecha, 
+         variacion_desto_acum) %>%
+  pivot_wider(names_from = fecha, 
+              values_from = variacion_desto_acum)
+```
+
+```{r}
+comp_cons_promv <- comp_cons %>%
+  mutate(fecha = paste0(fecha, "_val_md")) %>%  
+  select(Cliente, Marca_ints, fecha, 
+         valor_promedio_llevado) %>%
+  pivot_wider(names_from = fecha, 
+              values_from = valor_promedio_llevado)
+```
+
+```{r}
+comp_cons_promd <- comp_cons %>%
+  mutate(fecha = paste0(fecha, "_dcto_md")) %>%  
+  select(Cliente, Marca_ints, fecha, 
+         descuento_promedio_llevado) %>%
+  pivot_wider(names_from = fecha, 
+              values_from = descuento_promedio_llevado)
+```
+
+```{r}
+output_tem <- merge(output_tem, comp_cons_valor, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+output_tem <- merge(output_tem, comp_cons_dcto, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+output_tem <- merge(output_tem, comp_cons_promv, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+output_tem <- merge(output_tem, comp_cons_promd, 
+                     by = c("Cliente", "Marca_ints"), all.x = T)
+
+output_tem <- output_tem %>% mutate_all(~replace(., is.na(.), 0))
+```
+
+Remover la prob
+
+```{r}
+output_tem$prob <- NULL
+```
+
+# Modelado en Machine Learning
+
+## Random Forest
+
+### División del conjunto de datos
+
+
+```{r}
+# Entrenamiento completo
+marcas_ints <- names(output[,-1])
+#roc_auc_marcas <- c()
+
+output_prueba <- output %>% 
+   mutate(Cliente = as.character(Cliente)) %>% 
+   select(Cliente)
+
+output_prueba_oct <- output_prueba
+
+for(marca_pred in marcas_ints){
+  
+  # 1. Seleccionar los datos por marca y conjunto train/test
+  data <- prob_compra %>% 
+    filter(Marca_ints == marca_pred) %>%
+    select(-c(Marca_ints, Marca2, split)) %>% 
+    mutate(compra = factor(compra, levels = c("Si", "No")))
+
+  train <- prob_compra %>% 
+    filter(Marca_ints == marca_pred, split == "Train") %>%
+    select(-c(Marca_ints, Marca2, split)) %>% 
+    mutate(compra = factor(compra, levels = c("Si", "No")))
+  
+  test <- prob_compra %>% 
+    filter(Marca_ints == marca_pred, split == "Test") %>%
+    select(-c(Marca_ints, Marca2, split)) %>% 
+    mutate(compra = factor(compra, levels = c("Si", "No")))
+  
+  # 2. Preprocesar datos
+  prob_compra_rec  <- recipe(compra ~ ., data = data) %>%
+    step_rm("Cliente") %>% 
+    step_zv(all_predictors()) %>% # Quitar las variables de unico valor
+    step_normalize(all_numeric()) %>% # Normalizar las variables
+    step_dummy(all_nominal(), -compra, one_hot = TRUE) # Generar dummies
+  
+  # 3. Configurar el modelo de machine learning
+  prob_compra_rf_model <- rand_forest() %>%
+   set_args(mtry = tune(),
+            trees = tune(),
+            min_n = tune()) %>%
+   set_engine("ranger", importance = "impurity") %>%
+   set_mode("classification")
+
+   #prob_compra_rf_model %>% translate()
+  
+  # 4. Definir el flujo de trabajo
+  rf_workflow <- workflow() %>%
+   add_recipe(prob_compra_rec) %>%
+   add_model(prob_compra_rf_model)
+  
+  # 5. Calibrar los parametros del modelo
+  prob_compra_cv <- vfold_cv(train, v = 5)
+  
+  rf_grid <- expand_grid(mtry = c(7, 10, 13),
+                         trees = c(200, 300),
+                         min_n = c(5, 10, 15))
+  
+  rf_tune_results <- rf_workflow %>%
+        tune_grid(resamples = prob_compra_cv, # Objeto que contienen los folds
+        grid = rf_grid, # La combinación de los parametros
+        metrics = metric_set(roc_auc) # Metricas utilizadas
+        )
+  
+  rf_metrics <- rf_tune_results %>%
+              collect_metrics()
+  print(rf_metrics)
+  
+  rf_metrics %>%
+   filter(.metric == "roc_auc") %>%
+   ggplot(aes(mtry, mean, col = factor(trees))) +
+   geom_line(alpha = 0.5, size = 1) +
+   ggtitle("ROC en función del mtry y el número de áboles")
+  
+  param_final <- rf_tune_results %>%
+  select_best(metric = "roc_auc")
+  
+  print(param_final)
+  
+  rf_workflow <- rf_workflow %>%
+   finalize_workflow(param_final)
+
+  # rf_workflow
+  
+  # 6. Ajusta final del modelo
+  final_model <- fit(rf_workflow, train)
+  final_model
+  
+  # 7. Validación con el test
+  test <- test %>% 
+    cbind(predict(final_model, new_data = test %>% select(-compra), type = "prob")[,1]) 
+  
+  test %>% roc_auc(compra, .pred_Si) %>% print()
+ 
+  test %>% roc_curve(compra, .pred_Si) %>% autoplot()
+  
+  names(test)[ncol(test)] <- marca_pred
+  
+  predicciones <- test %>% select(Cliente, marca_pred)
+  
+  output_prueba <- left_join(output_prueba, predicciones, by = "Cliente")
+  
+  # Prediccion para el mes de octubre
+if (marca_pred == "Marca_Inno1") {
+    
+    output_tem2 <- output_tem %>%
+    filter(Marca_ints == "Marca_Inno1") %>%
+    select(-c(Marca_ints, Marca2))
+  
+  output_tem2$prob <-  predict(object = final_model, 
+                               new_data = output_tem2, type = "prob")[[2]]
+  
+  output_tem2 <- output_tem2 %>% 
+    select(Cliente, prob)
+    
+    output_prueba_oct <- merge(output_prueba_oct, output_tem2, 
+                               by = "Cliente", all.x = T) %>% 
+      rename(Marca_Inno1 = prob)
+    
+  } else if (marca_pred == "Marca_Inno2") {
+      
+    output_tem2 <- output_tem %>%
+    filter(Marca_ints == "Marca_Inno2") %>%
+    select(-c(Marca_ints, Marca2))
+  
+  output_tem2$prob <-  predict(object = final_model, 
+                               new_data = output_tem2, type = "prob")[[2]]
+  
+  output_tem2 <- output_tem2 %>% 
+    select(Cliente, prob)
+    
+     output_prueba_oct <- merge(output_prueba_oct, output_tem2, 
+                                by = "Cliente", all.x = T) %>% 
+      rename(Marca_Inno2 = prob)
+    
+  } else if (marca_pred == "Marca1") {
+    
+    output_tem2 <- output_tem %>%
+    filter(Marca_ints == "Marca1") %>%
+    select(-c(Marca_ints, Marca2))
+  
+  output_tem2$prob <-  predict(object = final_model, 
+                               new_data = output_tem2, type = "prob")[[2]]
+  
+  output_tem2 <- output_tem2 %>% 
+    select(Cliente, prob)
+    
+     output_prueba_oct <- merge(output_prueba_oct, output_tem2, 
+                                by = "Cliente", all.x = T) %>% 
+      rename(Marca1 = prob)
+    
+  } else if (marca_pred == "Marca2") {
+    
+    output_tem2 <- output_tem %>%
+    filter(Marca_ints == "Marca2") %>%
+    select(-c(Marca_ints, Marca2))
+  
+  output_tem2$prob <-  predict(object = final_model, 
+                               new_data = output_tem2, type = "prob")[[2]]
+  
+  output_tem2 <- output_tem2 %>% 
+    select(Cliente, prob)
+    
+     output_prueba_oct <- merge(output_prueba_oct, output_tem2, 
+                                by = "Cliente", all.x = T) %>% 
+      rename(Marca2 = prob)
+      
+  } else {
+    
+    output_tem2 <- output_tem %>%
+    filter(Marca_ints == "Marca3") %>%
+    select(-c(Marca_ints, Marca2))
+  
+  output_tem2$prob <-  predict(object = final_model, 
+                               new_data = output_tem2, type = "prob")[[2]]
+  
+  output_tem2 <- output_tem2 %>% 
+    select(Cliente, prob)
+    
+     output_prueba_oct <- merge(output_prueba_oct, output_tem2, 
+                                by = "Cliente", all.x = T) %>% 
+      rename(Marca3 = prob)
+    
+  }
+  
+  
+  
+  #test %>% 
+  #cbind(predict(final_model, new_data = test %>% select(-compra), type = "prob")[,1]) %>% 
+  #mutate(compra_pred = factor(ifelse(.pred_Si >= 0.1, "Si", "No"), levels = c("Si", "No"))) %>% 
+  #conf_mat(compra, compra_pred) %>% print()
+ 
+ }
+
+```
+
+Almacenar documento
+
+```{r}
+write_csv(x = output_prueba_oct, path = "Datasets/Input3_clientes_test10.csv")
+```
+
+## Xgboost
+
+```{r}
+for(marca_pred in marcas_ints){
+  
+  # 1. Seleccionar los datos por marca y conjunto train/test
+  data <- prob_compra %>% 
+  filter(Marca_ints == marca_pred) %>%
+  select(-c(Marca_ints, Marca2, split)) %>% 
+  mutate(compra = factor(compra, levels = c("Si", "No")))
+
+  train <- prob_compra %>% 
+    filter(Marca_ints == marca_pred, split == "Train") %>%
+    select(-c(Marca_ints, Marca2, split)) %>% 
+    mutate(compra = factor(compra, levels = c("Si", "No")))
+  
+  test <- prob_compra %>% 
+    filter(Marca_ints == marca_pred, split == "Test") %>%
+    select(-c(Marca_ints, Marca2, split)) %>% 
+    mutate(compra = factor(compra, levels = c("Si", "No")))
+  
+  # 2. Preprocesar datos
+  prob_compra_rec  <- recipe(compra ~ ., data = data) %>%
+    step_rm("Cliente") %>% 
+    step_zv(all_predictors()) %>% # Quitar las variables de unico valor
+    step_normalize(all_numeric()) %>% # Normalizar las variables
+    step_dummy(all_nominal(), -compra, one_hot = TRUE) # Generar dummies
+  
+  # 3. Configurar el modelo de machine learning
+  prob_compra_boosting_model <- boost_tree() %>%
+   set_args(mtry = tune(),
+            trees = tune(),
+            min_n = tune(), 
+            tree_depth = tune()) %>%
+   set_engine("xgboost") %>%
+   set_mode("classification")
+
+   #prob_compra_rf_model %>% translate()
+  
+  # 4. Definir el flujo de trabajo
+  boosting_workflow <- workflow() %>%
+   add_recipe(prob_compra_rec) %>%
+   add_model(prob_compra_boosting_model)
+  
+  # 5. Calibrar los parametros del modelo
+  prob_compra_cv <- vfold_cv(train, v = 5)
+  
+  boosting_grid <- expand_grid(mtry = c(7, 10, 13),
+                         trees = c(200, 300),
+                         min_n = c(5, 10, 15), 
+                         tree_depth = c(3,5))
+  
+  boosting_tune_results <- boosting_workflow %>%
+        tune_grid(resamples = prob_compra_cv, # Objeto que contienen los folds
+        grid = boosting_grid, # La combinación de los parametros
+        metrics = metric_set(roc_auc) # Metricas utilizadas
+        )
+  
+  boosting_metrics <- boosting_tune_results %>%
+              collect_metrics()
+  print(boosting_metrics)
+  
+  boosting_metrics %>%
+   filter(.metric == "roc_auc") %>%
+   ggplot(aes(mtry, mean, col = factor(trees))) +
+   geom_line(alpha = 0.5, size = 1) +
+   ggtitle("ROC en función del mtry y el número de áboles")
+  
+  param_final <- boosting_tune_results %>%
+  select_best(metric = "roc_auc")
+  
+  print(param_final)
+  
+  boosting_workflow <- boosting_workflow %>%
+   finalize_workflow(param_final)
+
+  # rf_workflow
+  
+  # 6. Ajusta final del modelo
+  final_model <- fit(boosting_workflow, train)
+  final_model
+  
+  # 7. Validación con el test
+  test <- test %>% 
+    cbind(predict(final_model, new_data = test %>% select(-compra), type = "prob")[,1]) 
+  
+  test %>% roc_auc(compra, .pred_Si) %>% print()
+ 
+  test %>% roc_curve(compra, .pred_Si) %>% autoplot()
+  
+  names(test)[ncol(test)] <- marca_pred
+  
+  predicciones <- test %>% select(Cliente, marca_pred)
+  
+  output_prueba <- left_join(output_prueba, predicciones, by = "Cliente")
+  
+  #test %>% 
+  #cbind(predict(final_model, new_data = test %>% select(-compra), type = "prob")[,1]) %>% 
+  #mutate(compra_pred = factor(ifelse(.pred_Si >= 0.1, "Si", "No"), levels = c("Si", "No"))) %>% 
+  #conf_mat(compra, compra_pred) %>% print()
+ 
+ }
+```
+
+Almacenar documento
+
+```{r}
+names(output_prueba) <- names(output)
+write_delim(x = output_prueba,
+            path = "Datasets/Input3_clientes_test4.csv", 
+            delim = ",")
+```
+
+## Modelo de redes neuronales
+
+```{r}
+# Guardar los auc
+roc_auc_nnet <- list()
+
+# Guardar los modelos
+nnet_models <- list()
+
+output_prueba_nnet <- output %>% 
+   mutate(Cliente = as.character(Cliente)) %>% 
+   select(Cliente)
+
+for(i in 1:5){
+  marca_pred <- marcas_ints[i]
+  # 1. Seleccionar los datos por marca y conjunto train/test
+  data <- prob_compra %>% 
+  filter(Marca_ints == marca_pred) %>%
+  select(-c(Marca_ints, Marca2, split)) %>% 
+  mutate(compra = factor(compra, levels = c("Si", "No")))
+
+  train <- prob_compra %>% 
+    filter(Marca_ints == marca_pred, split == "Train") %>%
+    select(-c(Marca_ints, Marca2, split)) %>% 
+    mutate(compra = factor(compra, levels = c("Si", "No")))
+  
+  test <- prob_compra %>% 
+    filter(Marca_ints == marca_pred, split == "Test") %>%
+    select(-c(Marca_ints, Marca2, split)) %>% 
+    mutate(compra = factor(compra, levels = c("Si", "No")))
+  
+  # 2. Preprocesar datos
+  prob_compra_rec  <- recipe(compra ~ ., data = data) %>%
+    step_rm("Cliente") %>% 
+    step_zv(all_predictors()) %>% # Quitar las variables de unico valor
+    step_normalize(all_numeric()) %>% # Normalizar las variables
+    step_dummy(all_nominal(), -compra, one_hot = TRUE) # Generar dummies
+  
+  # 3. Configurar el modelo de machine learning
+  prob_compra_nnet_model <- mlp() %>%
+   set_args(hidden_units = tune(),
+            epochs = tune()) %>%
+   set_engine("nnet") %>%
+   set_mode("classification")
+
+   #prob_compra_rf_model %>% translate()
+  
+  # 4. Definir el flujo de trabajo
+  nnet_workflow <- workflow() %>%
+   add_recipe(prob_compra_rec) %>%
+   add_model(prob_compra_nnet_model)
+  
+  # 5. Calibrar los parametros del modelo
+  prob_compra_cv <- vfold_cv(train, v = 5)
+  
+  nnet_grid <- expand_grid(hidden_units = c(5,7),
+                         epochs = c(100,150))
+  
+  nnet_tune_results <- nnet_workflow %>%
+        tune_grid(resamples = prob_compra_cv, # Objeto que contienen los folds
+        grid = nnet_grid, # La combinación de los parametros
+        metrics = metric_set(roc_auc) # Metricas utilizadas
+        )
+  
+  nnet_metrics <- nnet_tune_results %>%
+              collect_metrics()
+  print(nnet_metrics)
+  
+  param_final <- nnet_tune_results %>%
+  select_best(metric = "roc_auc")
+  
+  print(param_final)
+  
+  nnet_workflow <- nnet_workflow %>%
+   finalize_workflow(param_final)
+
+  # 6. Ajusta final del modelo
+  final_model <- fit(nnet_workflow, train)
+  nnet_models[[marca_pred]] <- final_model
+  print(final_model)
+  
+  
+  # 7. Validación con el test
+  test <- test %>% 
+    cbind(predict(final_model, new_data = test %>% select(-compra), type = "prob")[,1]) 
+  
+  test %>% roc_auc(compra, .pred_Si) %>% print()
+  
+  roc_auc_nnet[[marca_pred]] = test %>% roc_auc(compra, .pred_Si)
+ 
+  names(test)[ncol(test)] <- marca_pred
+  
+  predicciones <- test %>% select(Cliente, marca_pred)
+  
+  output_prueba_nnet <- left_join(output_prueba_nnet, predicciones, by = "Cliente")
+  
+}
+  # Combinacion de modelos
+  
+  stack_models <- output_prueba_rf %>% 
+  bind_rows(output_prueba_boosting, output_prueba_boosting) %>% 
+  pivot_longer(cols = Marca1:Marca_Inno2, names_to = "Marca", values_to = "Probabilidad") %>% 
+  group_by(Cliente, Marca) %>% 
+  summarise(Probabilidad = mean(Probabilidad)) %>% 
+  pivot_wider(names_from = Marca, values_from = Probabilidad) %>% 
+  mutate(Cliente = as.numeric(Cliente))
+
+
+output_stack <- output %>% 
+  select(Cliente) %>% 
+  left_join(stack_models, by = "Cliente")
+```
+
+
+# Resultados
+
+```{r}
+cart_clientes <- merge(output_prueba %>% 
+                         pivot_longer(cols = c(marcas_ints), names_to = "marca",
+                           values_to = "prob"), clientes, 
+                       by = "Cliente", all.x = T)
+
+cart_clientes <- cart_clientes %>% 
+  mutate(compra = if_else(prob < 0.1, "Si", "No"))
+
+cart_clientes %>%
+  group_by(cat_subcanal, marca) %>%
+  summarise(n_si = sum(if_else(compra == "Si", 1, 0)),
+            n = n(),
+            prp_si = n_si/n) %>% 
+  ggplot(aes(x = prp_si, y = fct_reorder(cat_subcanal, prp_si))) + 
+  facet_wrap(vars(marca)) + geom_col(fill = 'red') +
+  labs(x = "Proporción de compra", y = "Subcategoria") + theme_light()
+  
+```
+
